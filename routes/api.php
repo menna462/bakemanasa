@@ -46,6 +46,9 @@ Route::middleware('auth:sanctum')->prefix('admin')->group(function () {
     Route::post('/team', [AdminAuthController::class, 'storeMember']);
     Route::patch('/team/{id}/toggle-status', [AdminAuthController::class, 'toggleStatus']);
 
+    // Flat Lessons (for Code Generation & Select Dropdowns)
+    Route::get('/lessons', [CurriculumController::class, 'flatLessons']);
+
     // Activation Codes Management
     Route::prefix('codes')->group(function () {
         Route::get('/', [CodeController::class, 'index']);
@@ -61,6 +64,7 @@ Route::middleware('auth:sanctum')->prefix('admin')->group(function () {
     // Curriculum & Content Management
     Route::prefix('curriculum')->group(function () {
         Route::get('/', [CurriculumController::class, 'index']);
+        Route::get('/lessons', [CurriculumController::class, 'flatLessons']);
         Route::post('/grades', [CurriculumController::class, 'storeGrade']);
         Route::put('/grades/{id}', [CurriculumController::class, 'updateGrade']);
         Route::delete('/grades/{id}', [CurriculumController::class, 'destroyGrade']);

@@ -63,14 +63,20 @@ class AnalyticsController extends Controller
      */
     public function lecturePerformance(): JsonResponse
     {
+        $activatedCounts = ActivationCode::where('status', 'used')
+            ->whereNotNull('lesson_id')
+            ->groupBy('lesson_id')
+            ->selectRaw('lesson_id, count(*) as total')
+            ->pluck('total', 'lesson_id');
+
         $lessons = Lesson::with(['studentProgress', 'gradeLevel'])
             ->where('status', 'published')
             ->orderBy('order_number')
             ->get();
 
-        $items = $lessons->map(function ($lesson) {
+        $items = $lessons->map(function ($lesson) use ($activatedCounts) {
             $progressList = $lesson->studentProgress;
-            $activatedCount = ActivationCode::where('lesson_id', $lesson->id)->where('status', 'used')->count();
+            $activatedCount = $activatedCounts[$lesson->id] ?? 0;
 
             $completedCount = $progressList->where('completed', true)->count();
             $completionRate = $progressList->count() > 0 
@@ -243,11 +249,16 @@ class AnalyticsController extends Controller
         $grades = GradeLevel::all();
         $colors = ['#FF6A00', '#2563EB', '#10B981', '#8B5CF6'];
 
+        $gradeCounts = ActivationCode::whereNotNull('grade_level_id')
+            ->groupBy('grade_level_id')
+            ->selectRaw('grade_level_id, count(*) as total')
+            ->pluck('total', 'grade_level_id');
+
         $gradeDist = [];
         $totalCodes = ActivationCode::count();
 
         foreach ($grades as $idx => $g) {
-            $cnt = ActivationCode::where('grade_level_id', $g->id)->count();
+            $cnt = $gradeCounts[$g->id] ?? 0;
             $pct = $totalCodes > 0 ? (int) round(($cnt / $totalCodes) * 100) : 0;
             $gradeDist[] = [
                 'gradeName' => $g->title,

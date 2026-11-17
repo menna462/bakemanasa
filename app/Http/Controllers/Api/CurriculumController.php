@@ -8,86 +8,134 @@ use App\Models\Lesson;
 use App\Models\Unit;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Cache;
 
 class CurriculumController extends Controller
 {
+    /**
+     * Clear all cached curriculum responses.
+     */
+    protected function clearCurriculumCache(): void
+    {
+        Cache::forget('curriculum_tree');
+        Cache::forget('curriculum_flat_lessons');
+    }
+
     /**
      * Get entire curriculum tree (grades -> units -> lessons) matching frontend interfaces.
      */
     public function index(): JsonResponse
     {
-        $grades = GradeLevel::with([
-            'units' => function ($q) {
-                $q->orderBy('unit_number')->with([
-                    'lessons' => function ($lq) {
-                        $lq->orderBy('order_number');
-                    }
-                ]);
-            }
-        ])->orderBy('order_number')->get();
+        $payload = Cache::remember('curriculum_tree', 3600, function () {
+            $grades = GradeLevel::with([
+                'units' => function ($q) {
+                    $q->orderBy('unit_number')->with([
+                        'lessons' => function ($lq) {
+                            $lq->orderBy('order_number');
+                        }
+                    ]);
+                }
+            ])->orderBy('order_number')->get();
 
-        $formattedGrades = $grades->map(function ($grade) {
-            $allLessons = $grade->units->flatMap->lessons;
-            $pdfCount = $allLessons->where('has_pdf', true)->count();
+            $formattedGrades = $grades->map(function ($grade) {
+                $allLessons = $grade->units->flatMap->lessons;
+                $pdfCount = $allLessons->where('has_pdf', true)->count();
+
+                return [
+                    'id' => (string) $grade->id,
+                    'title' => $grade->title,
+                    'subtitle' => $grade->subtitle ?? '',
+                    'unitsCount' => $grade->units->count(),
+                    'lessonsCount' => $allLessons->count(),
+                    'pdfCount' => $pdfCount,
+                    'isActive' => (bool) $grade->is_active,
+                    'statusText' => $grade->status_text ?? 'نشط حالياً',
+                    'statusType' => $grade->status_type ?? 'active',
+                    'units' => $grade->units->map(function ($unit, $index) {
+                        $unitPdfCount = $unit->lessons->where('has_pdf', true)->count();
+                        return [
+                            'id' => (string) $unit->id,
+                            'unitNumber' => (int) $unit->unit_number,
+                            'title' => $unit->title,
+                            'lessonsCount' => $unit->lessons->count(),
+                            'pdfCount' => $unitPdfCount,
+                            'isExpanded' => $index === 0,
+                            'lessons' => $unit->lessons->map(function ($lesson) {
+                                return [
+                                    'id' => (string) $lesson->id,
+                                    'orderNumber' => (int) $lesson->order_number,
+                                    'title' => $lesson->title,
+                                    'duration' => $lesson->duration ?? '00:00:00',
+                                    'size' => $lesson->size ?? '',
+                                    'viewsCount' => (string) $lesson->views_count,
+                                    'hasPdf' => (bool) $lesson->has_pdf,
+                                    'pdfTitle' => $lesson->pdf_title,
+                                    'pdfUrl' => $lesson->pdf_url,
+                                    'hasQuiz' => (bool) $lesson->has_quiz,
+                                    'quizTitle' => $lesson->quiz_title,
+                                    'status' => $lesson->status,
+                                    'videoSource' => $lesson->video_source,
+                                    'videoUrl' => $lesson->video_url,
+                                    'videoProvider' => $lesson->video_provider,
+                                ];
+                            }),
+                        ];
+                    }),
+                ];
+            });
+
+            $totalGrades = $grades->count();
+            $totalUnits = Unit::count();
+            $totalLessons = Lesson::count();
+            $totalPdfs = Lesson::where('has_pdf', true)->count();
 
             return [
-                'id' => (string) $grade->id,
-                'title' => $grade->title,
-                'subtitle' => $grade->subtitle ?? '',
-                'unitsCount' => $grade->units->count(),
-                'lessonsCount' => $allLessons->count(),
-                'pdfCount' => $pdfCount,
-                'isActive' => (bool) $grade->is_active,
-                'statusText' => $grade->status_text ?? 'نشط حالياً',
-                'statusType' => $grade->status_type ?? 'active',
-                'units' => $grade->units->map(function ($unit, $index) {
-                    $unitPdfCount = $unit->lessons->where('has_pdf', true)->count();
-                    return [
-                        'id' => (string) $unit->id,
-                        'unitNumber' => (int) $unit->unit_number,
-                        'title' => $unit->title,
-                        'lessonsCount' => $unit->lessons->count(),
-                        'pdfCount' => $unitPdfCount,
-                        'isExpanded' => $index === 0,
-                        'lessons' => $unit->lessons->map(function ($lesson) {
-                            return [
-                                'id' => (string) $lesson->id,
-                                'orderNumber' => (int) $lesson->order_number,
-                                'title' => $lesson->title,
-                                'duration' => $lesson->duration ?? '00:00:00',
-                                'size' => $lesson->size ?? '',
-                                'viewsCount' => (string) $lesson->views_count,
-                                'hasPdf' => (bool) $lesson->has_pdf,
-                                'pdfTitle' => $lesson->pdf_title,
-                                'pdfUrl' => $lesson->pdf_url,
-                                'hasQuiz' => (bool) $lesson->has_quiz,
-                                'quizTitle' => $lesson->quiz_title,
-                                'status' => $lesson->status,
-                                'videoSource' => $lesson->video_source,
-                                'videoUrl' => $lesson->video_url,
-                                'videoProvider' => $lesson->video_provider,
-                            ];
-                        }),
-                    ];
-                }),
+                'success' => true,
+                'stats' => [
+                    'gradesCount' => $totalGrades,
+                    'unitsCount' => $totalUnits,
+                    'lessonsCount' => $totalLessons,
+                    'pdfCount' => $totalPdfs,
+                ],
+                'data' => $formattedGrades,
             ];
         });
 
-        $totalGrades = $grades->count();
-        $totalUnits = Unit::count();
-        $totalLessons = Lesson::count();
-        $totalPdfs = Lesson::where('has_pdf', true)->count();
+        return response()->json($payload);
+    }
 
-        return response()->json([
-            'success' => true,
-            'stats' => [
-                'gradesCount' => $totalGrades,
-                'unitsCount' => $totalUnits,
-                'lessonsCount' => $totalLessons,
-                'pdfCount' => $totalPdfs,
-            ],
-            'data' => $formattedGrades,
-        ]);
+    /**
+     * Get flat list of all lessons formatted for dropdowns (Admin Code Generation).
+     */
+    public function flatLessons(): JsonResponse
+    {
+        $payload = Cache::remember('curriculum_flat_lessons', 3600, function () {
+            $lessons = Lesson::with(['unit.gradeLevel', 'gradeLevel'])
+                ->orderBy('id', 'desc')
+                ->get()
+                ->map(function ($lesson) {
+                    $gradeTitle = $lesson->gradeLevel?->title 
+                        ?? $lesson->unit?->gradeLevel?->title 
+                        ?? 'عام';
+                    $unitTitle = $lesson->unit?->title ?? '';
+
+                    return [
+                        'id' => (string) $lesson->id,
+                        'title' => $lesson->title,
+                        'unitTitle' => $unitTitle,
+                        'gradeTitle' => $gradeTitle,
+                        'formattedTitle' => "{$gradeTitle} ◄ {$lesson->title}",
+                        'duration' => $lesson->duration ?? '',
+                    ];
+                });
+
+            return [
+                'success' => true,
+                'data' => $lessons,
+            ];
+        });
+
+        return response()->json($payload);
     }
 
     /**
@@ -113,6 +161,8 @@ class CurriculumController extends Controller
             'status_type' => 'active',
         ]);
 
+        $this->clearCurriculumCache();
+
         return response()->json([
             'success' => true,
             'message' => 'تم إنشاء المرحلة الدراسية بنجاح.',
@@ -135,6 +185,7 @@ class CurriculumController extends Controller
         ]);
 
         $grade->update($validated);
+        $this->clearCurriculumCache();
 
         return response()->json([
             'success' => true,
@@ -150,6 +201,7 @@ class CurriculumController extends Controller
     {
         $grade = GradeLevel::findOrFail($id);
         $grade->delete();
+        $this->clearCurriculumCache();
 
         return response()->json([
             'success' => true,
@@ -183,6 +235,8 @@ class CurriculumController extends Controller
             'is_published' => true,
         ]);
 
+        $this->clearCurriculumCache();
+
         return response()->json([
             'success' => true,
             'message' => 'تم إضافة الوحدة الدراسية بنجاح.',
@@ -204,6 +258,7 @@ class CurriculumController extends Controller
         ]);
 
         $unit->update($validated);
+        $this->clearCurriculumCache();
 
         return response()->json([
             'success' => true,
@@ -219,6 +274,7 @@ class CurriculumController extends Controller
     {
         $unit = Unit::findOrFail($id);
         $unit->delete();
+        $this->clearCurriculumCache();
 
         return response()->json([
             'success' => true,
@@ -271,6 +327,8 @@ class CurriculumController extends Controller
             'status' => $validated['status'] ?? 'published',
         ]);
 
+        $this->clearCurriculumCache();
+
         return response()->json([
             'success' => true,
             'message' => 'تم حفظ ونشر المحاضرة بنجاح.',
@@ -301,6 +359,7 @@ class CurriculumController extends Controller
         ]);
 
         $lesson->update($validated);
+        $this->clearCurriculumCache();
 
         return response()->json([
             'success' => true,
@@ -316,6 +375,7 @@ class CurriculumController extends Controller
     {
         $lesson = Lesson::findOrFail($id);
         $lesson->delete();
+        $this->clearCurriculumCache();
 
         return response()->json([
             'success' => true,
