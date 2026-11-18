@@ -18,6 +18,7 @@ class ActivationCode extends Model
         'group_name',
         'grade_level_id',
         'lesson_id',
+        'unit_id',
         'created_by_admin_id',
         'validity_days',
         'status',
@@ -40,6 +41,11 @@ class ActivationCode extends Model
     public function lesson(): BelongsTo
     {
         return $this->belongsTo(Lesson::class);
+    }
+
+    public function unit(): BelongsTo
+    {
+        return $this->belongsTo(Unit::class);
     }
 
     public function gradeLevel(): BelongsTo

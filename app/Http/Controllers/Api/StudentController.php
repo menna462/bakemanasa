@@ -30,7 +30,7 @@ class StudentController extends Controller
 
         $rawCode = strtoupper(trim($validated['code']));
 
-        $codeModel = ActivationCode::with(['lesson.unit.gradeLevel', 'gradeLevel'])
+        $codeModel = ActivationCode::with(['lesson.unit.gradeLevel', 'unit.lessons', 'gradeLevel'])
             ->where('code', $rawCode)
             ->first();
 
@@ -67,8 +67,16 @@ class StudentController extends Controller
                 'expires_at' => $now->copy()->addDays($codeModel->validity_days ?: 30),
             ]);
 
-            // Create initial progress record if lesson exists
-            $lessonId = $codeModel->lesson_id ?? Lesson::where('status', 'published')->value('id');
+            // Create initial progress record
+            // For unit-level codes: create progress for the first lesson in that unit
+            // For lesson-level codes: create progress for the specific lesson
+            $lessonId = $codeModel->lesson_id;
+            if (!$lessonId && $codeModel->unit_id && $codeModel->unit) {
+                $lessonId = $codeModel->unit->lessons->first()?->id;
+            }
+            if (!$lessonId) {
+                $lessonId = Lesson::where('status', 'published')->value('id');
+            }
             if ($lessonId) {
                 StudentProgress::firstOrCreate([
                     'activation_code_id' => $codeModel->id,
@@ -97,20 +105,59 @@ class StudentController extends Controller
 
     /**
      * Get complete lecture payload for the Lecture Viewer page.
+     * Access is granted if the student has:
+     *   - A code assigned to this specific lesson (lesson_id match), OR
+     *   - A code assigned to the unit that contains this lesson (unit_id match).
      */
     public function getLecture(Request $request, $code): JsonResponse
     {
         $rawCode = strtoupper(trim($code));
 
-        $codeModel = ActivationCode::with(['lesson.unit.gradeLevel', 'gradeLevel'])
+        $codeModel = ActivationCode::with(['lesson.unit.gradeLevel', 'unit.lessons', 'gradeLevel'])
             ->where('code', $rawCode)
             ->first();
 
-        // Fallback to first available lesson if code is general demo
+        // Determine the target lesson based on code scope or requested lesson_id
         $targetLesson = null;
-        if ($codeModel && $codeModel->lesson) {
-            $targetLesson = $codeModel->lesson;
-        } else {
+        $requestedLessonId = $request->query('lesson_id');
+
+        if ($requestedLessonId) {
+            $candidate = Lesson::with('unit.gradeLevel')->find($requestedLessonId);
+            if ($candidate) {
+                $hasAccess = false;
+                if (!$codeModel) {
+                    $hasAccess = true;
+                } elseif ($codeModel->unit_id && (int) $codeModel->unit_id === (int) $candidate->unit_id) {
+                    $hasAccess = true;
+                } elseif ($codeModel->lesson_id && (int) $codeModel->lesson_id === (int) $candidate->id) {
+                    $hasAccess = true;
+                } elseif (!$codeModel->unit_id && !$codeModel->lesson_id) {
+                    $hasAccess = true;
+                }
+
+                if ($hasAccess) {
+                    $targetLesson = $candidate;
+                } else {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'كود التفعيل الحالي غير مصرح له بفتح هذا الدرس.',
+                    ], 403);
+                }
+            }
+        }
+
+        if (!$targetLesson && $codeModel) {
+            if ($codeModel->lesson_id && $codeModel->lesson) {
+                // Code is for a specific lesson
+                $targetLesson = $codeModel->lesson;
+            } elseif ($codeModel->unit_id && $codeModel->unit) {
+                // Code is for a full unit — show the first lesson in that unit
+                $targetLesson = $codeModel->unit->lessons->first();
+            }
+        }
+
+        // Fallback to first published lesson
+        if (!$targetLesson) {
             $targetLesson = Lesson::with('unit.gradeLevel')->where('status', 'published')->first();
         }
 
@@ -137,15 +184,33 @@ class StudentController extends Controller
         ->where('grade_level_id', $gradeLevelId)
         ->orderBy('unit_number')
         ->get()
-        ->map(function ($unit) use ($targetLesson) {
+        ->map(function ($unit) use ($targetLesson, $codeModel) {
+            // Determine which lessons this code grants access to
+            $accessibleLessonIds = [];
+            if ($codeModel) {
+                if ($codeModel->unit_id === $unit->id) {
+                    // Unit-level code: all lessons in this unit are accessible
+                    $accessibleLessonIds = $unit->lessons->pluck('id')->toArray();
+                } elseif ($codeModel->lesson_id) {
+                    // Lesson-level code: only the specific lesson
+                    $accessibleLessonIds = [$codeModel->lesson_id];
+                } elseif (!$codeModel->unit_id && !$codeModel->lesson_id) {
+                    // General platform code: all lessons accessible
+                    $accessibleLessonIds = $unit->lessons->pluck('id')->toArray();
+                }
+            } else {
+                $accessibleLessonIds = $unit->lessons->pluck('id')->toArray();
+            }
+
             return [
                 'id' => (string) $unit->id,
                 'number' => (int) $unit->unit_number,
                 'title' => $unit->title,
                 'subtitle' => $unit->subtitle ?? "{$unit->lessons->count()} محاضرات",
-                'lessons' => $unit->lessons->map(function ($l) use ($targetLesson) {
+                'lessons' => $unit->lessons->map(function ($l) use ($targetLesson, $accessibleLessonIds) {
                     $isCurrent = $l->id === $targetLesson->id;
-                    $status = $isCurrent ? 'playing' : ($l->order_number < $targetLesson->order_number ? 'completed' : 'locked');
+                    $isAccessible = in_array($l->id, $accessibleLessonIds);
+                    $status = $isCurrent ? 'playing' : ($isAccessible ? 'completed' : 'locked');
                     return [
                         'id' => (string) $l->id,
                         'number' => (int) $l->order_number,
@@ -154,6 +219,7 @@ class StudentController extends Controller
                         'status' => $status,
                         'completedPercent' => $isCurrent ? 35 : ($status === 'completed' ? 100 : 0),
                         'badge' => $isCurrent ? 'الآن' : ($status === 'completed' ? 'تم' : null),
+                        'accessible' => $isAccessible || $isCurrent,
                     ];
                 }),
                 'quiz' => [
@@ -182,9 +248,20 @@ class StudentController extends Controller
                 ];
             });
 
+        // Code scope info for the frontend
+        $codeScope = 'general';
+        if ($codeModel) {
+            if ($codeModel->unit_id) {
+                $codeScope = 'unit';
+            } elseif ($codeModel->lesson_id) {
+                $codeScope = 'lesson';
+            }
+        }
+
         return response()->json([
             'success' => true,
             'code' => $codeModel ? $codeModel->code : $rawCode,
+            'codeScope' => $codeScope,
             'lesson' => [
                 'id' => (string) $targetLesson->id,
                 'title' => $targetLesson->title,

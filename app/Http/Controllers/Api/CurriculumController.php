@@ -57,6 +57,7 @@ class CurriculumController extends Controller
                             'id' => (string) $unit->id,
                             'unitNumber' => (int) $unit->unit_number,
                             'title' => $unit->title,
+                            'subtitle' => $unit->subtitle ?? '',
                             'lessonsCount' => $unit->lessons->count(),
                             'pdfCount' => $unitPdfCount,
                             'isExpanded' => $index === 0,
@@ -105,11 +106,13 @@ class CurriculumController extends Controller
     }
 
     /**
-     * Get flat list of all lessons formatted for dropdowns (Admin Code Generation).
+     * Get flat list of all lessons AND units formatted for dropdowns (Admin Code Generation).
+     * Returns both individual lessons and full units as selectable options.
      */
     public function flatLessons(): JsonResponse
     {
         $payload = Cache::remember('curriculum_flat_lessons', 3600, function () {
+            // 1. Individual lessons
             $lessons = Lesson::with(['unit.gradeLevel', 'gradeLevel'])
                 ->orderBy('id', 'desc')
                 ->get()
@@ -126,12 +129,34 @@ class CurriculumController extends Controller
                         'gradeTitle' => $gradeTitle,
                         'formattedTitle' => "{$gradeTitle} ◄ {$lesson->title}",
                         'duration' => $lesson->duration ?? '',
+                        'type' => 'lesson',
+                    ];
+                });
+
+            // 2. Full units (each covers all its lessons)
+            $units = Unit::with(['gradeLevel', 'lessons'])
+                ->orderBy('id', 'desc')
+                ->get()
+                ->map(function ($unit) {
+                    $gradeTitle = $unit->gradeLevel?->title ?? 'عام';
+                    $lessonsCount = $unit->lessons->count();
+
+                    return [
+                        'id' => (string) $unit->id,
+                        'title' => $unit->title,
+                        'unitTitle' => $unit->title,
+                        'gradeTitle' => $gradeTitle,
+                        'formattedTitle' => "{$gradeTitle} ◄ {$unit->title} ({$lessonsCount} دروس)",
+                        'duration' => '',
+                        'type' => 'unit',
+                        'lessonsCount' => $lessonsCount,
                     ];
                 });
 
             return [
                 'success' => true,
                 'data' => $lessons,
+                'units' => $units,
             ];
         });
 

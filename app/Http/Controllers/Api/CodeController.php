@@ -4,6 +4,8 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\ActivationCode;
+use App\Models\Lesson;
+use App\Models\Unit;
 use Carbon\Carbon;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -16,7 +18,11 @@ class CodeController extends Controller
      */
     public function index(Request $request): JsonResponse
     {
-        $query = ActivationCode::query()->with(['lesson:id,title,duration', 'gradeLevel:id,title']);
+        $query = ActivationCode::query()->with([
+            'lesson:id,title,duration',
+            'unit:id,title',
+            'gradeLevel:id,title',
+        ]);
 
         // Search by code, group name, or student
         if ($search = $request->query('search')) {
@@ -53,9 +59,12 @@ class CodeController extends Controller
             $query->where('group_name', $group);
         }
 
-        // Filter by lesson or grade
+        // Filter by lesson or unit or grade
         if ($lessonId = $request->query('lesson_id')) {
             $query->where('lesson_id', $lessonId);
+        }
+        if ($unitId = $request->query('unit_id')) {
+            $query->where('unit_id', $unitId);
         }
         if ($gradeId = $request->query('grade_level_id')) {
             $query->where('grade_level_id', $gradeId);
@@ -113,6 +122,9 @@ class CodeController extends Controller
 
     /**
      * Generate bulk activation codes.
+     * Supports both unit-level and lesson-level codes.
+     *   - unitId   → code covers all lessons in that unit
+     *   - lessonId → code covers a single lesson only
      */
     public function generate(Request $request): JsonResponse
     {
@@ -121,6 +133,7 @@ class CodeController extends Controller
             'groupName' => 'required|string|max:255',
             'validityDays' => 'nullable|integer|min:1|max:365',
             'lessonId' => 'nullable|exists:lessons,id',
+            'unitId' => 'nullable|exists:units,id',
             'gradeLevelId' => 'nullable|exists:grade_levels,id',
         ], [
             'groupName.required' => 'يرجى إدخال اسم المجموعة أو ملاحظات السنتر.',
@@ -132,11 +145,21 @@ class CodeController extends Controller
         $groupName = trim($validated['groupName']);
         $validityDays = (int) ($validated['validityDays'] ?? 30);
         $lessonId = $validated['lessonId'] ?? null;
+        $unitId = $validated['unitId'] ?? null;
         $gradeLevelId = $validated['gradeLevelId'] ?? null;
+
+        // If unit is specified, don't set lesson_id — the code covers the whole unit
+        if ($unitId) {
+            $lessonId = null; // unit-level code
+            $matchedUnit = Unit::find($unitId);
+            if ($matchedUnit && !$gradeLevelId) {
+                $gradeLevelId = $matchedUnit->grade_level_id;
+            }
+        }
 
         // Auto-link grade level if lesson is specified
         if ($lessonId && !$gradeLevelId) {
-            $matchedLesson = \App\Models\Lesson::find($lessonId);
+            $matchedLesson = Lesson::find($lessonId);
             if ($matchedLesson) {
                 $gradeLevelId = $matchedLesson->grade_level_id;
             }
@@ -145,7 +168,6 @@ class CodeController extends Controller
         $adminId = $request->user() ? $request->user()->id : null;
 
         $createdCodes = [];
-        $today = Carbon::now();
 
         for ($i = 0; $i < $count; $i++) {
             $uniqueCode = $this->generateUniqueCode();
@@ -155,21 +177,23 @@ class CodeController extends Controller
                 'group_name' => $groupName,
                 'grade_level_id' => $gradeLevelId,
                 'lesson_id' => $lessonId,
+                'unit_id' => $unitId,
                 'created_by_admin_id' => $adminId,
                 'validity_days' => $validityDays,
                 'status' => 'new',
             ]);
 
-            if ($lessonId) {
-                $record->load('lesson:id,title,duration');
-            }
+            // Eager load relations for response formatting
+            $record->load(['lesson:id,title,duration', 'unit:id,title']);
 
             $createdCodes[] = $this->formatCodeItem($record);
         }
 
+        $scopeLabel = $unitId ? 'وحدة كاملة' : ($lessonId ? 'درس محدد' : 'عام');
+
         return response()->json([
             'success' => true,
-            'message' => "تم توليد {$count} كود تفعيل جديد بنجاح للدفعة [{$groupName}].",
+            'message' => "تم توليد {$count} كود تفعيل جديد بنجاح للدفعة [{$groupName}] — نطاق: {$scopeLabel}.",
             'count' => $count,
             'data' => $createdCodes,
         ], 201);
@@ -180,13 +204,14 @@ class CodeController extends Controller
      */
     public function show($id): JsonResponse
     {
-        $code = ActivationCode::with(['lesson', 'gradeLevel', 'studentProgress', 'createdByAdmin:id,full_name'])
+        $code = ActivationCode::with(['lesson', 'unit.lessons', 'gradeLevel', 'studentProgress', 'createdByAdmin:id,full_name'])
             ->findOrFail($id);
 
         return response()->json([
             'success' => true,
             'data' => array_merge($this->formatCodeItem($code), [
                 'lesson' => $code->lesson,
+                'unit' => $code->unit,
                 'gradeLevel' => $code->gradeLevel,
                 'createdBy' => $code->createdByAdmin ? $code->createdByAdmin->full_name : null,
                 'studentPhone' => $code->student_phone,
@@ -257,7 +282,7 @@ class CodeController extends Controller
      */
     public function export(Request $request): JsonResponse
     {
-        $query = ActivationCode::query()->with(['lesson:id,title,duration']);
+        $query = ActivationCode::query()->with(['lesson:id,title,duration', 'unit:id,title']);
 
         if ($ids = $request->input('ids')) {
             $query->whereIn('id', (array) $ids);
@@ -277,12 +302,10 @@ class CodeController extends Controller
 
     /**
      * Generate a unique 8-digit numeric activation code.
-     * Example: 48317290
      */
     private function generateUniqueCode(): string
     {
         do {
-            // First digit never 0 to avoid leading-zero ambiguity
             $code = (string) random_int(10000000, 99999999);
         } while (ActivationCode::where('code', $code)->exists());
 
@@ -294,6 +317,18 @@ class CodeController extends Controller
      */
     private function formatCodeItem(ActivationCode $code): array
     {
+        // Determine the content label: unit name, lesson name, or general
+        $contentLabel = 'كود عام (شامل المنهج)';
+        $contentScope = 'general'; // 'unit' | 'lesson' | 'general'
+
+        if ($code->unit_id && $code->unit) {
+            $contentLabel = 'وحدة: ' . $code->unit->title;
+            $contentScope = 'unit';
+        } elseif ($code->lesson_id && $code->lesson) {
+            $contentLabel = $code->lesson->title;
+            $contentScope = 'lesson';
+        }
+
         return [
             'id'            => (string) $code->id,
             'code'          => $code->code,
@@ -304,8 +339,11 @@ class CodeController extends Controller
             'usedBy'        => $code->used_by,
             'activatedAt'   => $code->activated_at ? $code->activated_at->format('Y/m/d') : null,
             'expiresAt'     => $code->expires_at ? $code->expires_at->format('Y/m/d') : null,
-            'lessonTitle'   => $code->lesson ? $code->lesson->title : 'كود عام (شامل المنهج)',
+            'lessonTitle'   => $contentLabel,
             'lessonDuration'=> $code->lesson ? $code->lesson->duration : '—',
+            'contentScope'  => $contentScope,
+            'unitId'        => $code->unit_id ? (string) $code->unit_id : null,
+            'lessonId'      => $code->lesson_id ? (string) $code->lesson_id : null,
         ];
     }
 }
