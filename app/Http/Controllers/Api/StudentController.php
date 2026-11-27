@@ -24,11 +24,13 @@ class StudentController extends Controller
             'student_name' => 'nullable|string|max:255',
             'student_phone' => 'nullable|string|max:50',
             'device' => 'nullable|in:mobile,desktop,tablet',
+            'device_fingerprint' => 'nullable|string|max:255',
         ], [
             'code.required' => 'يرجى إدخال كود التفعيل للدخول.',
         ]);
 
         $rawCode = strtoupper(trim($validated['code']));
+        $incomingFingerprint = $validated['device_fingerprint'] ?? null;
 
         $codeModel = ActivationCode::with(['lesson.unit.gradeLevel', 'unit.lessons', 'gradeLevel'])
             ->where('code', $rawCode)
@@ -54,18 +56,40 @@ class StudentController extends Controller
             ], 403);
         }
 
-        // If code is new, activate it
+        // ── Device Locking Logic ─────────────────────────────────────────────
+        // If code is already in use (status = 'used'), verify device fingerprint.
+        // If a different device tries to use it, block access.
+        if ($codeModel->status === 'used' && $incomingFingerprint) {
+            $storedFingerprint = $codeModel->device_fingerprint;
+            if ($storedFingerprint && $storedFingerprint !== $incomingFingerprint) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'هذا الكود مرتبط بجهاز آخر ولا يمكن استخدامه على جهازك الحالي. إذا كنت تعتقد أن هذا خطأ، تواصل مع فريق الدعم الفني.',
+                ], 403);
+            }
+            // Same device — allow access through (fall to response below)
+        }
+        // ────────────────────────────────────────────────────────────────────
+
+        // If code is new, activate it and lock it to this device
         if ($codeModel->status === 'new') {
             $studentName = $validated['student_name'] ?? 'طالب منصة';
             $studentPhone = $validated['student_phone'] ?? null;
 
-            $codeModel->update([
+            $updateData = [
                 'status' => 'used',
                 'used_by' => $studentName,
                 'student_phone' => $studentPhone,
                 'activated_at' => $now,
                 'expires_at' => $now->copy()->addDays($codeModel->validity_days ?: 30),
-            ]);
+            ];
+
+            // Lock to device fingerprint on first activation
+            if ($incomingFingerprint) {
+                $updateData['device_fingerprint'] = $incomingFingerprint;
+            }
+
+            $codeModel->update($updateData);
 
             // Create initial progress record
             // For unit-level codes: create progress for the first lesson in that unit
@@ -108,14 +132,28 @@ class StudentController extends Controller
      * Access is granted if the student has:
      *   - A code assigned to this specific lesson (lesson_id match), OR
      *   - A code assigned to the unit that contains this lesson (unit_id match).
+     * Device fingerprint is verified to enforce single-device locking.
      */
     public function getLecture(Request $request, $code): JsonResponse
     {
         $rawCode = strtoupper(trim($code));
+        $incomingFingerprint = $request->query('device_fingerprint');
 
         $codeModel = ActivationCode::with(['lesson.unit.gradeLevel', 'unit.lessons', 'gradeLevel'])
             ->where('code', $rawCode)
             ->first();
+
+        // ── Device Lock Check ────────────────────────────────────────────────
+        // If code has a stored fingerprint and the incoming fingerprint doesn't match, block.
+        if ($codeModel && $codeModel->device_fingerprint && $incomingFingerprint) {
+            if ($codeModel->device_fingerprint !== $incomingFingerprint) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'هذا الكود مرتبط بجهاز آخر ولا يمكن فتح المحاضرة على جهازك الحالي. تواصل مع فريق الدعم إذا تعرضت لمشكلة.',
+                ], 403);
+            }
+        }
+        // ────────────────────────────────────────────────────────────────────
 
         // Determine the target lesson based on code scope or requested lesson_id
         $targetLesson = null;
